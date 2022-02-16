@@ -22,22 +22,22 @@ SDL_Renderer *renderer = NULL;
 SDL_Texture *texture = NULL;
 
 int quit(int code) {
-    if (!packet)
+    if (packet)
         av_packet_free(&packet);
 
-    if (!rgb_data[0])
+    if (rgb_data[0])
         av_freep(&rgb_data[0]);
 
-    if (!pFrame)
+    if (pFrame)
         av_frame_free(&pFrame);
 
-    if (!pCodecCtx)
+    if (pCodecCtx)
     {
         avcodec_close(pCodecCtx);
         avcodec_free_context(&pCodecCtx);
     }
 
-    if (!pFormatCtx)
+    if (pFormatCtx)
     {  
         avformat_close_input(&pFormatCtx);
     }
