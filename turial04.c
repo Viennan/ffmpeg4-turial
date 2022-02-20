@@ -37,7 +37,8 @@ typedef struct BlockingQueue {
     uint64_t size;
     uint64_t max_size;
     SDL_mutex *mutex;
-    SDL_cond  *cond;
+    SDL_cond  *get_cond;
+    SDL_cond  *put_cond;
 } BlockingQueue;
 
 typedef enum PlayerStatus {
@@ -104,7 +105,8 @@ ListNode* create_list_node(void* dptr, uint64_t sz)
 void init_blocking_queue(BlockingQueue* q, uint64_t max_size)
 {
     q->mutex = SDL_CreateMutex();
-    q->cond = SDL_CreateCond();
+    q->put_cond = SDL_CreateCond();
+    q->get_cond = SDL_CreateCond();
     q->closed = 0;
     q->head = create_list_node(NULL, 0); // dummy node
     q->tail = q->head;
@@ -116,14 +118,16 @@ void close_blocking_queue(BlockingQueue* q)
 {
     SDL_LockMutex(q->mutex);
     q->closed = 1;
-    SDL_CondSignal(q->cond);
+    SDL_CondSignal(q->put_cond);
+    SDL_CondSignal(q->get_cond);
     SDL_UnlockMutex(q->mutex);
 }
 
 void free_blocking_queue(BlockingQueue* q)
 {
     SDL_DestroyMutex(q->mutex);
-    SDL_DestroyCond(q->cond);
+    SDL_DestroyCond(q->put_cond);
+    SDL_DestroyCond(q->get_cond);
     while(q->head != NULL)
     {
         ListNode* node = q->head;
@@ -137,16 +141,17 @@ int queue_put_node(BlockingQueue* q, ListNode* node)
 {
     int ret = 0;
     SDL_LockMutex(q->mutex);
+    while(q->size + node->size > q->max_size && !q->closed)
+        SDL_CondWait(q->put_cond, q->mutex);
+
     if (q->closed)
         ret = AVERROR(EACCES);
-    else if (q->size + node->size > q->max_size)
-        ret = AVERROR(EAGAIN);
     else
     {
         q->tail->next = node;
         q->tail = node;
         q->size += node->size;
-        SDL_CondSignal(q->cond);
+        SDL_CondSignal(q->get_cond);
     }
     SDL_UnlockMutex(q->mutex);
     return ret;
@@ -163,7 +168,7 @@ int queue_get(BlockingQueue* q, void **dptr)
     int ret = 0;
     SDL_LockMutex(q->mutex);
     while(q->head == q->tail && !q->closed)
-        SDL_CondWait(q->cond, q->mutex);
+        SDL_CondWait(q->get_cond, q->mutex);
 
     if (q->closed && q->head == q->tail)
         ret = AVERROR(EACCES);
@@ -176,6 +181,7 @@ int queue_get(BlockingQueue* q, void **dptr)
         q->size -= node->size;
         av_free(q->head);
         q->head = node;
+        SDL_CondSignal(q->put_cond);
     }
     SDL_UnlockMutex(q->mutex);
     return ret;
@@ -226,22 +232,6 @@ int init_parser(AVFormatContext* pFormatCtx, int stream_id, AVCodec **psCodec, A
     *psCodec = pCodec;
     *psCodecCtx = pCodecCtx;
     return 0;
-}
-
-void scale_with_ratio(int src_w, int src_h, int dst_w, int dst_h, int *w, int *h)
-{
-    double ratio = (double)src_w / src_h;
-    int tmp_w = dst_h *ratio;
-    if (tmp_w > dst_w)
-    {
-        *w = dst_w;
-        *h = dst_w / ratio;
-    }
-    else
-    {
-        *w = tmp_w;
-        *h = dst_h;
-    }
 }
 
 int init_ffmpeg(PlayerContext *ctx)
@@ -343,21 +333,6 @@ int init_ffmpeg(PlayerContext *ctx)
     return 0;
 }
 
-static void send_null(BlockingQueue* q)
-{
-    int ret = AVERROR(EAGAIN);
-    while(ret < 0 && ret == AVERROR(EAGAIN))
-        ret = queue_put(q, NULL, 0);
-}
-
-static int send_with_delay(BlockingQueue* q, void* dptr, uint64_t sz, uint64_t ms)
-{
-    int ret = queue_put(q, dptr, sz);
-    if (ret < 0 && ret == AVERROR(EAGAIN))
-        SDL_Delay(ms);
-    return ret;
-}
-
 int demux_thread(void *arg)
 {
     PlayerContext *ctx = (PlayerContext*)arg;
@@ -372,47 +347,41 @@ int demux_thread(void *arg)
         if (status == PAUSE)
             continue;
 
-        if (!p)
+        p = av_packet_alloc();
+        ret = av_read_frame(ctx->pFormatCtx, p);
+        if (ret < 0)
         {
-            p = av_packet_alloc();
-            ret = av_read_frame(ctx->pFormatCtx, p);
-            if (ret < 0)
+            if (ret != AVERROR_EOF)
             {
-                if (ret != AVERROR_EOF)
-                {
-                    fprintf(stderr, "Demux Error: %s\n", av_err2str(ret));
-                    throw_event(SDL_QUIT, ctx);
-                }
-                break;
+                fprintf(stderr, "Demux Error: %s\n", av_err2str(ret));
+                throw_event(SDL_QUIT, ctx);
             }
+            break;
         }
         
         if (p && p->stream_index == ctx->audio_stream_id)
         {
-            ret = send_with_delay(&ctx->a_queue, p, p->size, 5);
-            if (ret == AVERROR(EACCES))
+            ret = queue_put(&ctx->a_queue, p, p->size);
+            if (ret < 0)
                 break;  
-            p = ret >= 0 ? NULL: p;
+            p = NULL;
         }
             
         if (p && p->stream_index == ctx->video_stream_id)
         {
-            ret = send_with_delay(&ctx->v_queue, p, p->size, 10);
-            if (ret == AVERROR(EACCES))
+            ret = queue_put(&ctx->v_queue, p, p->size);
+            if (ret < 0)
                 break;  
-            p = ret >= 0 ? NULL: p;   
+            p = NULL;
         }
     }
     // Flush Decoder
     if (ret == AVERROR_EOF)
     {
-        send_null(&ctx->a_queue);
-        send_null(&ctx->v_queue);
+        queue_put(&ctx->a_queue, NULL, 0);
+        queue_put(&ctx->v_queue, NULL, 0);
     }
-    if (p)
-    {
-        av_packet_free(&p);
-    }
+    av_packet_free(&p);
 
     // close blocking queue to prevent consumer thread wait forever
     close_blocking_queue(&ctx->a_queue);
@@ -468,10 +437,10 @@ int decode_video_thread(void* arg)
 
         if (p)
         {
-            int ret = send_with_delay(&ctx->v_play_queue, p, p->size, 10);
-            if (ret == AVERROR_EXIT)
+            int ret = queue_put(&ctx->v_play_queue, p, p->size);
+            if (ret < 0)
                 break;
-            p = ret >= 0 ? NULL: p;
+            p = NULL;
         }
         else
         {
