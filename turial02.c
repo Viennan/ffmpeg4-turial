@@ -184,7 +184,7 @@ int main(int argc, char *argv[]) {
                     break;
                 }
                 SDL_UpdateYUVTexture(
-                    texture, &rect, 
+                    texture, NULL, 
                     pFrame->buf[0]->data, y_pitch,
                     pFrame->buf[1]->data, uv_pitch,
                     pFrame->buf[2]->data, uv_pitch
