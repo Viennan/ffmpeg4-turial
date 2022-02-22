@@ -11,9 +11,14 @@
 #define AUDIO_QUEUE_SIZE 5 * 1024 * 1024
 #define VIDEO_QUEUE_SIZE 50 * 1024 * 1024
 #define VIDEO_PICTURE_QUEUE_SIZE 50 * 1024 * 1024
+#define MAX_ARRAY_QUEUE_SIZE 64 // Must be power of 2
+#define MAX_CACHED_PICTURE 3 // Pictures to be shown will not exceeded MAX_CACHED_PICTURE
+
+#define QUEUE_INDEX(x) ((x) & (MAX_ARRAY_QUEUE_SIZE-1))
 
 #define FF_REFRESH_EVENT (SDL_USEREVENT)
 #define FF_QUIT_EVENT (SDL_USEREVENT + 1)
+
 
 // Support YUV420P
 typedef struct VideoPicture {
@@ -41,6 +46,17 @@ typedef struct BlockingQueue {
     SDL_cond  *put_cond;
 } BlockingQueue;
 
+typedef struct ArrayBlockingQueue {
+    int r_ind, w_ind;
+    void *dptrs[MAX_ARRAY_QUEUE_SIZE];
+    int max_size;
+    int size;
+    int closed;
+    SDL_mutex *mutex;
+    SDL_cond  *get_cond;
+    SDL_cond  *put_cond;
+} ArrayBlockingQueue;
+
 typedef enum PlayerStatus {
     PAUSE = 0,
     Play = 1,
@@ -55,7 +71,8 @@ typedef struct PlayerContext {
     AVCodecContext          *pACodecCtx, *pVCodecCtx;
     AVCodec                 *pACodec, *pVCodec;
     SwrContext              *pASwrCtx;
-    BlockingQueue                   a_queue, v_queue, v_play_queue;
+    BlockingQueue           a_queue, v_queue;
+    ArrayBlockingQueue      v_play_queue;
     int                     frame_interval;
     Uint8                   *audio_buf;
 
@@ -187,12 +204,76 @@ int queue_get(BlockingQueue* q, void **dptr)
     return ret;
 }
 
-// if we can get object from the queue or not
-int queue_get_access(BlockingQueue* q)
+void init_array_blocking_queue(ArrayBlockingQueue *q, int max_size)
 {
-    int ret = 1;
+    SDL_assert(max_size <= MAX_ARRAY_QUEUE_SIZE);
+    q->mutex = SDL_CreateMutex();
+    q->get_cond = SDL_CreateCond();
+    q->put_cond = SDL_CreateCond();
+    memset(q->dptrs, 0, sizeof(q->dptrs));
+    q->closed = 0;
+    q->size = 0;
+    q->max_size = max_size;
+}
+
+void close_array_blocking_queue(ArrayBlockingQueue *q)
+{
     SDL_LockMutex(q->mutex);
-    ret = !(q->head == q->tail && q->closed);
+    q->closed = 1;
+    SDL_CondSignal(q->get_cond);
+    SDL_CondSignal(q->put_cond);
+    SDL_UnlockMutex(q->mutex);
+}
+
+void free_array_blocking_queue(ArrayBlockingQueue *q)
+{
+    SDL_DestroyMutex(q->mutex);
+    SDL_DestroyCond(q->put_cond);
+    SDL_DestroyCond(q->get_cond);
+}
+
+int array_queue_put(ArrayBlockingQueue *q, void *dptr)
+{
+    int ret = 0;
+    SDL_LockMutex(q->mutex);
+    while(q->size >= q->max_size && !q->closed)
+        SDL_CondWait(q->put_cond, q->mutex);
+    
+    if (q->closed)
+        ret = AVERROR(EACCES);
+    else
+    {
+        q->dptrs[q->w_ind] = dptr;
+        q->w_ind = QUEUE_INDEX(q->w_ind+1);
+        ++q->size;
+        SDL_CondSignal(q->get_cond);
+    }
+    SDL_UnlockMutex(q->mutex);
+    return ret;
+}
+
+int array_queue_get(ArrayBlockingQueue *q, void **dptrs, int block)
+{
+    int ret = 0;
+    SDL_LockMutex(q->mutex);
+    while(q->r_ind == q->w_ind && !q->closed && block)
+        SDL_CondWait(q->get_cond, q->mutex);
+    
+    if (q->r_ind != q->w_ind)
+    {
+        *dptrs = q->dptrs[q->r_ind];
+        q->dptrs[q->r_ind] = NULL;
+        q->r_ind = QUEUE_INDEX(q->r_ind + 1);
+        --q->size;
+        SDL_CondSignal(q->put_cond);
+    }
+    else
+    {
+        if (!block && !q->closed)
+            ret = AVERROR(EAGAIN);
+        else
+            ret = AVERROR(EACCES);
+    }
     SDL_UnlockMutex(q->mutex);
     return ret;
 }
@@ -437,7 +518,7 @@ int decode_video_thread(void* arg)
 
         if (p)
         {
-            int ret = queue_put(&ctx->v_play_queue, p, p->size);
+            int ret = array_queue_put(&ctx->v_play_queue, p);
             if (ret < 0)
                 break;
             p = NULL;
@@ -494,7 +575,7 @@ int decode_video_thread(void* arg)
         free_video_picture(&p);
     
     // close blocking queue to prevent consumer thread wait forever
-    close_blocking_queue(&ctx->v_play_queue);
+    close_array_blocking_queue(&ctx->v_play_queue);
     return 0;
 }
 
@@ -607,7 +688,7 @@ void display(PlayerContext *ctx)
         return;
 
     VideoPicture *p = NULL;
-    int ret = queue_get(&ctx->v_play_queue, (void**)&p);
+    int ret = array_queue_get(&ctx->v_play_queue, (void**)&p, 1);
     // only show image with ret >= 0
     if (ret < 0)
     {
@@ -682,7 +763,7 @@ int init_sdl(PlayerContext* ctx)
     ctx->mutex = SDL_CreateMutex();
     init_blocking_queue(&ctx->a_queue, AUDIO_QUEUE_SIZE);
     init_blocking_queue(&ctx->v_queue, VIDEO_QUEUE_SIZE);
-    init_blocking_queue(&ctx->v_play_queue, VIDEO_PICTURE_QUEUE_SIZE);
+    init_array_blocking_queue(&ctx->v_play_queue, MAX_CACHED_PICTURE);
     
     if (ctx->audio_stream_id >= 0)
     {
@@ -733,7 +814,7 @@ void free_player_context(PlayerContext** ctx_s)
     SDL_PauseAudio(1);
     close_blocking_queue(&ctx->a_queue);
     close_blocking_queue(&ctx->v_queue);
-    close_blocking_queue(&ctx->v_play_queue);
+    close_array_blocking_queue(&ctx->v_play_queue);
     int status;
     SDL_WaitThread(ctx->demux_tid, &status);
     SDL_WaitThread(ctx->v_decode_tid, &status);
@@ -754,16 +835,16 @@ void free_player_context(PlayerContext** ctx_s)
     }
 
     // free video picture
-    node = ctx->v_play_queue.head;
-    while(node)
+    int idx = ctx->v_play_queue.r_ind;
+    while(QUEUE_INDEX(idx) != ctx->v_play_queue.w_ind)
     {
-        free_video_picture((VideoPicture**)&node->dptr);
-        node = node->next;
+        free_video_picture(&ctx->v_play_queue.dptrs[idx]);
+        idx = QUEUE_INDEX(idx+1);
     }
 
     free_blocking_queue(&ctx->a_queue);
     free_blocking_queue(&ctx->v_queue);
-    free_blocking_queue(&ctx->v_play_queue);
+    free_array_blocking_queue(&ctx->v_play_queue);
     SDL_DestroyTexture(ctx->texture);
     SDL_DestroyRenderer(ctx->renderer);
     SDL_DestroyWindow(ctx->screen);
