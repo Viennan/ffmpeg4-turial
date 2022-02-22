@@ -688,7 +688,7 @@ void display(PlayerContext *ctx)
         return;
 
     VideoPicture *p = NULL;
-    int ret = array_queue_get(&ctx->v_play_queue, (void**)&p, 1);
+    int ret = array_queue_get(&ctx->v_play_queue, (void**)&p, 0);
     // only show image with ret >= 0
     if (ret < 0)
     {
