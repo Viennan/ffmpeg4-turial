@@ -365,7 +365,7 @@ static inline void* array_queue_peek(ArrayBlockingQueue *q)
     return q->dptrs[q->r_ind];
 }
 
-static inline void* array_queue_peek(ArrayBlockingQueue *q)
+static inline void* array_queue_next(ArrayBlockingQueue *q)
 {
     return q->dptrs[QUEUE_INDEX(q->r_ind+1, MAX_ARRAY_QUEUE_SIZE)];
 }
@@ -815,7 +815,6 @@ static double sync_video(VideoPicture** ps, double curr_pts, double r_speed, Pla
     }
     double gap = set_pooling_data(&ctx->video_diff_pool, p->pts - curr_pts);
     double duration = p->duration * r_speed;
-    double video_sync_r_speed = 1.0;
     if (gap > SYNC_THRESHOLD_SKIP)
     {
         *show_flag = 0;
@@ -826,41 +825,36 @@ static double sync_video(VideoPicture** ps, double curr_pts, double r_speed, Pla
         *show_flag = 0;
         duration = 0;
     }
-    else if (gap > SYNC_THRESHOLD_STRONG)
-    {
-        *show_flag = 1;
-        video_sync_r_speed = SYNC_VIDEO_R_SPEED_MAX;
-    }
-    else if (gap < -SYNC_THRESHOLD_STRONG)
-    {
-        *show_flag = 1;
-        video_sync_r_speed = SYNC_VIDEO_R_SPEED_MIN;
-    }
-    else if (gap > SYNC_THRESHOLD_WEAK)
-    {
-        *show_flag = 1;
-        video_sync_r_speed = MIN(SYNC_VIDEO_R_SPEED_MAX, ctx->video_sync_r_speed + SYNC_VIDEO_STEP);
-        ctx->video_sync_r_speed = video_sync_r_speed;
-    }
-    else if (gap < -SYNC_THRESHOLD_WEAK)
-    {
-        *show_flag = 1;
-        video_sync_r_speed = MAX(SYNC_VIDEO_R_SPEED_MIN, ctx->video_sync_r_speed - SYNC_VIDEO_STEP);
-        ctx->video_sync_r_speed = video_sync_r_speed;
-    }
-    else if (fabs(gap) < SYNC_THRESHOLD_VSPEED_RESET)
-    {
-        *show_flag = 1;
-        video_sync_r_speed = 1.0;
-    }
     else
     {
+        double video_sync_r_speed = ctx->video_sync_r_speed;
         *show_flag = 1;
-        video_sync_r_speed = ctx->video_sync_r_speed;
-    }
-    if (*show_flag)
+        if (gap > SYNC_THRESHOLD_STRONG)
+        {
+            video_sync_r_speed = SYNC_VIDEO_R_SPEED_MAX;
+        }
+        else if (gap < -SYNC_THRESHOLD_STRONG)
+        {
+            video_sync_r_speed = SYNC_VIDEO_R_SPEED_MIN;
+        }
+        else if (gap > SYNC_THRESHOLD_WEAK)
+        {
+            video_sync_r_speed = MIN(SYNC_VIDEO_R_SPEED_MAX, video_sync_r_speed + SYNC_VIDEO_STEP);
+        }
+        else if (gap < -SYNC_THRESHOLD_WEAK)
+        {
+            video_sync_r_speed = MAX(SYNC_VIDEO_R_SPEED_MIN, video_sync_r_speed - SYNC_VIDEO_STEP);
+        }
+        else if (fabs(gap) < SYNC_THRESHOLD_VSPEED_RESET)
+        {
+            video_sync_r_speed = 1.0;
+        }
+        else{}
+        ctx->video_sync_r_speed = video_sync_r_speed;
+        duration *= video_sync_r_speed;
         array_queue_get(&ctx->v_play_queue, (void**)ps, 0);
-    return duration * video_sync_r_speed; 
+    } 
+    return duration; 
 }
 
 static void display(PlayerContext *ctx)
@@ -898,9 +892,8 @@ static void display(PlayerContext *ctx)
         SDL_RenderCopy(ctx->renderer, ctx->texture, NULL, NULL);
         SDL_RenderPresent(ctx->renderer);
         free_video_picture(&p);
-    }   
-    double lasetest_pts = get_master_clock(ctx);
-    delay -= (lasetest_pts-curr_pts);
+    }
+    delay -= (get_master_clock(ctx) - curr_pts);
     schedule_refresh(ctx, MAX(1.0, delay));
 }
 
