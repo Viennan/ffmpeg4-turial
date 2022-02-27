@@ -822,8 +822,10 @@ static double sync_video(VideoPicture** ps, double curr_pts, double r_speed, Pla
     }
     else if (gap < -SYNC_THRESHOLD_SKIP)
     {
+        // skip current frame
         *show_flag = 0;
         duration = 0;
+        array_queue_get(&ctx->v_play_queue, (void**)ps, 0);
     }
     else
     {
@@ -891,8 +893,9 @@ static void display(PlayerContext *ctx)
         SDL_RenderClear(ctx->renderer);
         SDL_RenderCopy(ctx->renderer, ctx->texture, NULL, NULL);
         SDL_RenderPresent(ctx->renderer);
-        free_video_picture(&p);
     }
+    if (p != array_queue_peek(&ctx->v_play_queue))
+        free_video_picture(&p);
     delay -= (get_master_clock(ctx) - curr_pts);
     schedule_refresh(ctx, MAX(1.0, delay));
 }
