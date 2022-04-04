@@ -1,6 +1,8 @@
 project("ffmpeg4-turial")
 cmake_minimum_required(VERSION 3.4.0)
 
+link_libraries(m)
+
 find_package(SDL2 REQUIRED)
 include_directories(${SDL2_INCLUDE_DIRS})
 
@@ -13,3 +15,6 @@ foreach(mainfile IN LISTS mains)
     add_executable(${mainname} ${mainfile})
     target_link_libraries(${mainname} ${SDL2_LIBRARIES} ${FFMPEG_LIBS})
 endforeach()
+
+add_executable(PurePlayer PurePlayer.c)
+target_link_libraries(PurePlayer ${SDL2_LIBRARIES} ${FFMPEG_LIBS})
