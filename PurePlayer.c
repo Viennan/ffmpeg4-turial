@@ -276,8 +276,8 @@ static void free_video_picture(VideoPicture **ps)
     } else {
         if (p->data[0])
             av_freep(&p->data[0]);
-        av_free(p);
     }
+    av_free(p);
     *ps = NULL;
 }
 
