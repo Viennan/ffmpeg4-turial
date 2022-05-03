@@ -1,5 +1,9 @@
 .vscode
+.cache
 GPATH
 GRTAGS
 GTAGS
 build
+cmake-build-debug
+.clang-format
+.idea

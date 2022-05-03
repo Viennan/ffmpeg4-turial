@@ -1,3 +1,11 @@
+/*
+ * A simple video player with stepless (in theory) playing speed change ability.
+ * Author: Wang Yingnan
+ * Github: Viennan
+ * Email: wangynine@163.com
+ * Complete at 2022.05.03
+ */
+
 #include <stdio.h>
 #include <math.h>
 #include <unistd.h>
